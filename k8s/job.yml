@@ -1,0 +1,77 @@
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ecr-secret-updater-job
+  namespace: ecr-secret-updater
+spec:
+  # ECR's temporary authorization token is only valid for 12 hours.
+  schedule: "0 */10 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: ecr-secret-updater
+          containers:
+            - name: run-script
+              image: alpine:3.18
+              command: ["/app/update-ecr-secret.sh"]
+              env:
+                # Modify target namespaces below (space separated)
+                - name: "TARGET_NAMESPACES"
+                  value: "CHANGEME-NS1 CHANGEMENS-2 CHANGEME-NS3"
+              envFrom:
+                - secretRef:
+                    name: ecr-secret-updater-secrets
+              volumeMounts:
+                - name: app
+                  mountPath: /app
+                  readOnly: true
+          volumes:
+            - name: app
+              configMap:
+                name: ecr-secret-updater-script
+                defaultMode: 0744
+          restartPolicy: Never
+          activeDeadlineSeconds: 120
+          terminationGracePeriodSeconds: 5
+      backoffLimit: 0
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ecr-secret-updater-script
+  namespace: ecr-secret-updater
+data:
+  update-ecr-secret.sh: |-
+    #!/bin/sh
+
+    set -eu
+
+    # Install AWS
+    apk add --no-cache aws-cli bash curl
+
+    # Install kubectl
+    curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+
+    chmod +x kubectl
+    mv kubectl /usr/bin/kubectl
+    chmod +x /usr/bin/kubectl
+
+    # Create secret
+    AWS_ACCOUNT=$(aws sts get-caller-identity --query 'Account' | tr -d '"')
+    DOCKER_REGISTRY_SERVER="https://$AWS_ACCOUNT.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com"
+    DOCKER_USER="AWS"
+    DOCKER_PASSWORD=$(aws ecr get-login-password --region $AWS_DEFAULT_REGION)
+
+    for namespace in $TARGET_NAMESPACES; do
+      echo "Updating AWS ECR secret for $namespace"
+
+      kubectl delete secret aws-ecr -n $namespace || true
+      kubectl create secret docker-registry aws-ecr \
+        -n $namespace \
+        --docker-server="$DOCKER_REGISTRY_SERVER" \
+        --docker-username="$DOCKER_USER" \
+        --docker-password="$DOCKER_PASSWORD" \
+        --docker-email="no@email.local"
+    done
